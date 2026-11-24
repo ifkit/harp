@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 
+	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/glamour/v2"
@@ -21,7 +22,15 @@ type pane struct {
 	w       int // width with the scrollbar column
 }
 
-func newPane() pane { return pane{vp: viewport.New()} }
+func newPane() pane {
+	vp := viewport.New()
+	// Only PgUp/PgDn: the default letter and arrow keys fire while the user types.
+	vp.KeyMap = viewport.KeyMap{
+		PageUp:   key.NewBinding(key.WithKeys("pgup")),
+		PageDown: key.NewBinding(key.WithKeys("pgdown")),
+	}
+	return pane{vp: vp}
+}
 
 func (p *pane) resize(w, h int) {
 	p.vp.SetWidth(max(w-1, 0))
