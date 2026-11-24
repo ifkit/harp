@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -86,6 +87,34 @@ func TestStoreRewrite(t *testing.T) {
 		t.Fatalf("got=%v", got)
 	}
 	if files, _ := os.ReadDir(s.dir); len(files) != 1 {
+		t.Fatalf("leftover files: %v", files)
+	}
+}
+
+func TestStoreState(t *testing.T) {
+	s := &store{t.TempDir()}
+	s.Append("a", schema.UserMessage("1"))
+	if _, err := s.LoadState("a", langJS); !os.IsNotExist(err) {
+		t.Fatalf("missing state: %v", err)
+	}
+	for _, lang := range langs {
+		if err := s.SaveState("a", lang, []byte(lang)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(s.dir, "a.repl.lua.json")); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := s.LoadState("a", langJS); err != nil || string(b) != langJS {
+		t.Fatalf("b=%s err=%v", b, err)
+	}
+	if list, _ := s.List(); len(list) != 1 {
+		t.Fatalf("list=%v", list)
+	}
+	if err := s.Delete("a"); err != nil {
+		t.Fatal(err)
+	}
+	if files, _ := os.ReadDir(s.dir); len(files) != 0 {
 		t.Fatalf("leftover files: %v", files)
 	}
 }

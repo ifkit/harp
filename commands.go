@@ -59,8 +59,23 @@ func entriesFrom(history []*schema.Message) []entry {
 		case schema.User:
 			out = append(out, entry{sentUser, m.Content})
 		case schema.Assistant:
-			out = append(out, entry{answer, m.Content})
+			if m.Content != "" || len(m.ToolCalls) == 0 {
+				out = append(out, entry{answer, m.Content})
+			}
 		}
+		out = append(out, callEntries(m)...)
+	}
+	return out
+}
+
+// callEntries shows the tool calls of an assistant message, or the result in a tool message.
+func callEntries(m *schema.Message) []entry {
+	var out []entry
+	for _, c := range m.ToolCalls {
+		out = append(out, entry{toolCall, c.Function.Name + ":\n" + toolCode(c)})
+	}
+	if m.Role == schema.Tool {
+		out = append(out, entry{toolCall, "result:\n" + m.Content})
 	}
 	return out
 }
@@ -85,7 +100,38 @@ func (a *app) save(msgs ...*schema.Message) {
 	}
 }
 
+// saveState writes the runtime state of the current session.
+func (a *app) saveState() {
+	if a.store == nil || a.sessionID == "" {
+		return
+	}
+	if err := a.writeState(a.sessionID); err != nil {
+		a.fail("save runtime state: %v", err)
+	}
+}
+
+// writeState writes one state file for each runtime that was used or loaded.
+func (a *app) writeState(id string) error {
+	files, err := a.rt.save()
+	for lang, data := range files {
+		if err == nil {
+			err = a.store.SaveState(id, lang, data)
+		}
+	}
+	return err
+}
+
+// setHistory closes the current session and opens id with its runtime state.
 func (a *app) setHistory(id string, history []*schema.Message) {
+	a.saveState()
+	a.rt.close()
+	if a.store != nil && id != "" {
+		for _, lang := range langs {
+			if data, err := a.store.LoadState(id, lang); err == nil {
+				a.rt.load(lang, data)
+			}
+		}
+	}
 	a.sessionID, a.history = id, history
 	a.entries = entriesFrom(history)
 	a.think, a.reply = -1, -1
@@ -109,6 +155,9 @@ func (a *app) forkAt(n int) {
 	if err := a.store.Append(id, h...); err != nil {
 		a.fail("save session: %v", err)
 		return
+	}
+	if err := a.writeState(id); err != nil {
+		a.fail("save runtime state: %v", err)
 	}
 	a.setHistory(id, h)
 	a.note("forked into session " + id)
@@ -329,6 +378,7 @@ func (a *app) deleteSession(id string) {
 		return
 	}
 	if id == a.sessionID {
+		a.rt.close() // the state file is gone: do not write it again
 		if err := a.reset(); err != nil {
 			a.fail("new session: %v", err)
 		}

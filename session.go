@@ -100,6 +100,22 @@ func (s *store) Rewrite(id string, msgs []*schema.Message) error {
 	if err != nil {
 		return err
 	}
+	return s.replace(s.path(id), buf)
+}
+
+func (s *store) statePath(id, lang string) string {
+	return filepath.Join(s.dir, id+".repl."+lang+".json")
+}
+
+// SaveState replaces the state file of one runtime of the session.
+func (s *store) SaveState(id, lang string, data []byte) error {
+	return s.replace(s.statePath(id, lang), data)
+}
+
+func (s *store) LoadState(id, lang string) ([]byte, error) { return os.ReadFile(s.statePath(id, lang)) }
+
+// replace writes buf to path through a temporary file, so a crash keeps the old file whole.
+func (s *store) replace(path string, buf []byte) error {
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return err
 	}
@@ -112,7 +128,7 @@ func (s *store) Rewrite(id string, msgs []*schema.Message) error {
 		err = cerr
 	}
 	if err == nil {
-		err = os.Rename(tmp.Name(), s.path(id))
+		err = os.Rename(tmp.Name(), path)
 	}
 	if err != nil {
 		os.Remove(tmp.Name())
@@ -120,7 +136,17 @@ func (s *store) Rewrite(id string, msgs []*schema.Message) error {
 	return err
 }
 
-func (s *store) Delete(id string) error { return os.Remove(s.path(id)) }
+func (s *store) Delete(id string) error {
+	if err := os.Remove(s.path(id)); err != nil {
+		return err
+	}
+	for _, lang := range langs {
+		if err := os.Remove(s.statePath(id, lang)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
 
 // List returns the sessions, newest first.
 func (s *store) List() ([]sessionInfo, error) {

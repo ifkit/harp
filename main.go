@@ -48,7 +48,8 @@ const (
 	thinking
 	answer // rendered as Markdown
 	failure
-	notice // gray, not part of the history
+	notice   // gray, not part of the history
+	toolCall // a tool call or its result: gray like notice
 	debugKeys
 )
 
@@ -81,6 +82,9 @@ type app struct {
 	store     *store
 	sessionID string  // empty until the first message
 	pick      *picker // not nil: a picker replaces the chat view
+	rt        *runtimes
+	chunks    []*schema.Message // streamed chunks of the current reply
+	rounds    int               // tool rounds since the last user message
 }
 
 func newApp(cm model.BaseChatModel, debug bool, st *store) *app {
@@ -96,6 +100,7 @@ func newApp(cm model.BaseChatModel, debug bool, st *store) *app {
 		debug:     debug,
 		chat:      newPane(),
 		store:     st,
+		rt:        newRuntimes(),
 	}
 }
 
@@ -153,6 +158,7 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "ctrl+c":
+			a.saveState()
 			return a, tea.Quit
 		}
 		if a.pick != nil {
@@ -183,12 +189,14 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.save(a.history[len(a.history)-1])
 			a.entries = append(a.entries, entry{sentUser, text})
 			a.think, a.reply, a.busy = -1, -1, true
+			a.chunks, a.rounds = nil, 0
 			cmds = append(cmds, a.start())
 		}
 	case streamMsg:
 		a.sr = msg.sr
 		cmds = append(cmds, recv(a.sr))
 	case chunkMsg:
+		a.chunks = append(a.chunks, msg.msg)
 		if msg.msg.ReasoningContent != "" {
 			a.appendTo(&a.think, thinking, msg.msg.ReasoningContent)
 		}
@@ -197,13 +205,37 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		cmds = append(cmds, recv(a.sr))
 	case doneMsg:
-		a.busy = false
-		if msg.err != nil {
-			a.entries = append(a.entries, entry{failure, "error: " + msg.err.Error()})
-		} else if a.reply >= 0 {
-			a.history = append(a.history, schema.AssistantMessage(a.entries[a.reply].text, nil))
-			a.save(a.history[len(a.history)-1])
+		err := msg.err
+		var calls *schema.Message
+		if err == nil {
+			calls, err = toolTurn(a.chunks, &a.rounds)
 		}
+		a.chunks = nil
+		switch {
+		case err != nil:
+			a.busy = false
+			a.entries = append(a.entries, entry{failure, "error: " + err.Error()})
+		case calls != nil:
+			a.history = append(a.history, calls)
+			a.save(calls)
+			a.entries = append(a.entries, callEntries(calls)...)
+			a.think, a.reply = -1, -1
+			cmds = append(cmds, runTools(a.rt, calls))
+		default:
+			a.busy = false
+			if a.reply >= 0 {
+				a.history = append(a.history, schema.AssistantMessage(a.entries[a.reply].text, nil))
+				a.save(a.history[len(a.history)-1])
+			}
+		}
+	case toolDoneMsg:
+		a.history = append(a.history, msg.results...)
+		a.save(msg.results...)
+		for _, m := range msg.results {
+			a.entries = append(a.entries, callEntries(m)...)
+		}
+		a.saveState()
+		cmds = append(cmds, a.start())
 	}
 
 	if !a.ready {
@@ -323,10 +355,10 @@ func main() {
 			defer a.Close()
 			cm = a
 		}
-	} else {
-		cm, err = openai.NewChatModel(context.Background(), &openai.ChatModelConfig{
-			BaseURL: *url, APIKey: *key, Model: *name,
-		})
+	} else if cm, err = openai.NewChatModel(context.Background(), &openai.ChatModelConfig{
+		BaseURL: *url, APIKey: *key, Model: *name,
+	}); err == nil {
+		cm, err = withTools(cm)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
