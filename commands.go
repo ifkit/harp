@@ -7,6 +7,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 )
 
@@ -68,6 +69,20 @@ func entriesFrom(history []*schema.Message) []entry {
 	return out
 }
 
+// chatEntries rebuilds the chat view from the history and shows the tool declarations
+// after the system prompt when the model has the tools.
+func (a *app) chatEntries(history []*schema.Message) []entry {
+	es := entriesFrom(history)
+	if _, ok := a.chatModel.(model.ToolCallingChatModel); !ok || len(es) == 0 || es[0].role != sentSystem {
+		return es
+	}
+	var decl []string
+	for _, t := range toolInfos() {
+		decl = append(decl, t.Name+": "+t.Desc)
+	}
+	return slices.Insert(es, 1, entry{toolDecl, "tools:\n" + strings.Join(decl, "\n")})
+}
+
 // callEntries shows the tool calls of an assistant message, or the result in a tool message.
 func callEntries(m *schema.Message) []entry {
 	var out []entry
@@ -80,60 +95,26 @@ func callEntries(m *schema.Message) []entry {
 	return out
 }
 
-// save appends msgs to the current session. The first save creates the session
-// and writes the whole history, which already includes msgs.
-func (a *app) save(msgs ...*schema.Message) {
-	if a.store == nil {
-		return
-	}
-	var err error
-	if a.sessionID == "" {
-		id := newSessionID()
-		if err = a.store.Append(id, a.history...); err == nil {
-			a.sessionID = id
-		}
-	} else {
-		err = a.store.Append(a.sessionID, msgs...)
-	}
-	if err != nil {
+// add appends msgs to the current session.
+func (a *app) add(msgs ...*schema.Message) {
+	if err := a.session.add(msgs...); err != nil {
 		a.fail("save session: %v", err)
 	}
 }
 
-// saveState writes the runtime state of the current session.
 func (a *app) saveState() {
-	if a.store == nil || a.sessionID == "" {
-		return
-	}
-	if err := a.writeState(a.sessionID); err != nil {
+	if err := a.session.saveState(); err != nil {
 		a.fail("save runtime state: %v", err)
 	}
 }
 
-// writeState writes one state file for each runtime that was used or loaded.
-func (a *app) writeState(id string) error {
-	files, err := a.rt.save()
-	for lang, data := range files {
-		if err == nil {
-			err = a.store.SaveState(id, lang, data)
-		}
-	}
-	return err
-}
-
 // setHistory closes the current session and opens id with its runtime state.
 func (a *app) setHistory(id string, history []*schema.Message) {
-	a.saveState()
-	a.rt.close()
-	if a.store != nil && id != "" {
-		for _, lang := range langs {
-			if data, err := a.store.LoadState(id, lang); err == nil {
-				a.rt.load(lang, data)
-			}
-		}
+	if err := a.session.close(); err != nil {
+		a.fail("save runtime state: %v", err)
 	}
-	a.sessionID, a.history = id, history
-	a.entries = entriesFrom(history)
+	a.session = loadSession(a.store, id, history)
+	a.entries = a.chatEntries(history)
 	a.think, a.reply = -1, -1
 }
 
@@ -150,14 +131,12 @@ func (a *app) reset() error {
 
 // forkAt saves history[:n] as a new session and switches to it.
 func (a *app) forkAt(n int) {
-	h := slices.Clone(a.history[:n])
-	id := newSessionID()
-	if err := a.store.Append(id, h...); err != nil {
-		a.fail("save session: %v", err)
-		return
+	id, h, err := a.session.fork(n)
+	if err != nil {
+		a.fail("%v", err)
 	}
-	if err := a.writeState(id); err != nil {
-		a.fail("save runtime state: %v", err)
+	if id == "" {
+		return
 	}
 	a.setHistory(id, h)
 	a.note("forked into session " + id)
@@ -195,16 +174,16 @@ func (a *app) runCommand(cmd string) {
 		switch {
 		case isACP:
 			a.fail("%s is not available with --acp: the agent keeps the history", cmd)
-		case len(a.history) < 2:
+		case len(a.session.history) < 2:
 			a.fail("%s: no messages", cmd)
 		case cmd == "/fork":
-			a.forkAt(len(a.history))
+			a.forkAt(len(a.session.history))
 		default:
 			p := newPicker(pickRewind)
 			if cmd == "/fork-rewind" {
 				p.kind = pickForkRewind
 			}
-			for i, m := range a.history {
+			for i, m := range a.session.history {
 				if m.Role == schema.System {
 					continue
 				}
@@ -377,8 +356,8 @@ func (a *app) deleteSession(id string) {
 		a.pick = nil
 		return
 	}
-	if id == a.sessionID {
-		a.rt.close() // the state file is gone: do not write it again
+	if id == a.session.ID {
+		a.session.rt.close() // the state file is gone: do not write it again
 		if err := a.reset(); err != nil {
 			a.fail("new session: %v", err)
 		}
@@ -395,11 +374,11 @@ func (a *app) deleteSession(id string) {
 
 // rewindTo cuts the history to its first n messages and rewrites the session file.
 func (a *app) rewindTo(n int) {
-	h := slices.Clone(a.history[:n])
-	if err := a.store.Rewrite(a.sessionID, h); err != nil {
+	h, err := a.session.rewind(n)
+	if err != nil {
 		a.fail("rewrite session: %v", err)
 		return
 	}
-	a.setHistory(a.sessionID, h)
-	a.note("rewound session " + a.sessionID)
+	a.setHistory(a.session.ID, h)
+	a.note("rewound session " + a.session.ID)
 }

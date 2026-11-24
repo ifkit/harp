@@ -35,9 +35,10 @@ var answerStyle = func() ansi.StyleConfig {
 const systemPrompt = "You are a helpful assistant. Answer in Markdown."
 
 var (
-	styleMeta = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	styleUser = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
-	styleErr  = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	styleMeta  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleUser  = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	styleTools = lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
+	styleErr   = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 )
 
 type role int
@@ -49,7 +50,8 @@ const (
 	answer // rendered as Markdown
 	failure
 	notice   // gray, not part of the history
-	toolCall // a tool call or its result: gray like notice
+	toolCall // a tool call or its result: purple
+	toolDecl // the tool declarations sent to the API: purple
 	debugKeys
 )
 
@@ -68,11 +70,9 @@ type (
 
 type app struct {
 	chatModel model.BaseChatModel
-	history   []*schema.Message // exactly what the API receives
 	entries   []entry
 	think     int // index of the thinking entry of the current turn, -1 if none
 	reply     int // index of the answer entry of the current turn, -1 if none
-	sr        *schema.StreamReader[*schema.Message]
 	busy      bool
 	input     textinput.Model
 	chat      pane
@@ -80,30 +80,29 @@ type app struct {
 	debug     bool
 	hideMeta  bool // hides system and thinking entries
 	store     *store
-	sessionID string  // empty until the first message
+	session   *session
 	pick      *picker // not nil: a picker replaces the chat view
-	rt        *runtimes
-	chunks    []*schema.Message // streamed chunks of the current reply
-	rounds    int               // tool rounds since the last user message
 }
 
 func newApp(cm model.BaseChatModel, debug bool, st *store) *app {
 	in := textinput.New()
 	in.Prompt = "> "
-	return &app{
+	history := []*schema.Message{schema.SystemMessage(systemPrompt)}
+	a := &app{
 		chatModel: cm,
-		history:   []*schema.Message{schema.SystemMessage(systemPrompt)},
-		entries:   []entry{{sentSystem, systemPrompt}},
 		think:     -1,
 		reply:     -1,
 		input:     in,
 		debug:     debug,
 		chat:      newPane(),
 		store:     st,
-		rt:        newRuntimes(),
+		session:   loadSession(st, "", history),
 	}
+	a.entries = a.chatEntries(history)
+	return a
 }
 
+// tea.Model
 func (a *app) Init() tea.Cmd {
 	return tea.Batch(a.input.Focus(), textinput.Blink)
 }
@@ -123,7 +122,7 @@ func recv(sr *schema.StreamReader[*schema.Message]) tea.Cmd {
 }
 
 func (a *app) start() tea.Cmd {
-	history := a.history
+	history := a.session.history
 	return func() tea.Msg {
 		sr, err := a.chatModel.Stream(context.Background(), history)
 		if err != nil {
@@ -142,6 +141,7 @@ func (a *app) appendTo(idx *int, r role, s string) {
 	a.entries[*idx].text += s
 }
 
+// tea.Model
 func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 	if a.debug {
@@ -185,52 +185,49 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 			a.input.Reset()
-			a.history = append(a.history, schema.UserMessage(text))
-			a.save(a.history[len(a.history)-1])
+			a.add(schema.UserMessage(text))
 			a.entries = append(a.entries, entry{sentUser, text})
 			a.think, a.reply, a.busy = -1, -1, true
-			a.chunks, a.rounds = nil, 0
+			a.session.chunks, a.session.rounds = nil, 0
 			cmds = append(cmds, a.start())
 		}
 	case streamMsg:
-		a.sr = msg.sr
-		cmds = append(cmds, recv(a.sr))
+		a.session.sr = msg.sr
+		cmds = append(cmds, recv(a.session.sr))
 	case chunkMsg:
-		a.chunks = append(a.chunks, msg.msg)
+		a.session.chunks = append(a.session.chunks, msg.msg)
 		if msg.msg.ReasoningContent != "" {
 			a.appendTo(&a.think, thinking, msg.msg.ReasoningContent)
 		}
 		if msg.msg.Content != "" {
 			a.appendTo(&a.reply, answer, msg.msg.Content)
 		}
-		cmds = append(cmds, recv(a.sr))
+		cmds = append(cmds, recv(a.session.sr))
 	case doneMsg:
 		err := msg.err
+		var reply string
 		var calls *schema.Message
 		if err == nil {
-			calls, err = toolTurn(a.chunks, &a.rounds)
+			reply, calls, err = toolTurn(a.session.chunks, &a.session.rounds)
 		}
-		a.chunks = nil
+		a.session.chunks = nil
 		switch {
 		case err != nil:
 			a.busy = false
 			a.entries = append(a.entries, entry{failure, "error: " + err.Error()})
 		case calls != nil:
-			a.history = append(a.history, calls)
-			a.save(calls)
+			a.add(calls)
 			a.entries = append(a.entries, callEntries(calls)...)
 			a.think, a.reply = -1, -1
-			cmds = append(cmds, runTools(a.rt, calls))
+			cmds = append(cmds, runTools(a.session.rt, calls))
 		default:
 			a.busy = false
-			if a.reply >= 0 {
-				a.history = append(a.history, schema.AssistantMessage(a.entries[a.reply].text, nil))
-				a.save(a.history[len(a.history)-1])
+			if reply != "" {
+				a.add(schema.AssistantMessage(reply, nil))
 			}
 		}
 	case toolDoneMsg:
-		a.history = append(a.history, msg.results...)
-		a.save(msg.results...)
+		a.add(msg.results...)
 		for _, m := range msg.results {
 			a.entries = append(a.entries, callEntries(m)...)
 		}
@@ -276,6 +273,8 @@ func renderEntry(e entry, w int, md *glamour.TermRenderer) string {
 	switch e.role {
 	case sentUser:
 		return styleUser.Width(w).Render(e.text)
+	case toolCall, toolDecl:
+		return styleTools.Width(w).Render(e.text)
 	case failure:
 		return styleErr.Width(w).Render(e.text)
 	case answer:
@@ -290,11 +289,11 @@ func renderEntry(e entry, w int, md *glamour.TermRenderer) string {
 }
 
 // renderEntries joins the entries one per line. The Markdown renderer starts its output with a
-// blank line, so only an answer and a system message need a blank line after them.
+// blank line, so only an answer, a system message and the tool declarations need a blank line after them.
 func renderEntries(es []entry, w int, md *glamour.TermRenderer) string {
 	var parts []string
 	for i, e := range es {
-		if i > 0 && (es[i-1].role == answer || es[i-1].role == sentSystem) {
+		if i > 0 && (es[i-1].role == answer || es[i-1].role == sentSystem || es[i-1].role == toolDecl) {
 			parts = append(parts, "")
 		}
 		parts = append(parts, renderEntry(e, w, md))
@@ -305,13 +304,14 @@ func renderEntries(es []entry, w int, md *glamour.TermRenderer) string {
 func (a *app) refresh() {
 	var shown []entry
 	for _, e := range a.entries {
-		if !a.hideMeta || (e.role != sentSystem && e.role != thinking) {
+		if !a.hideMeta || (e.role != sentSystem && e.role != toolDecl && e.role != thinking) {
 			shown = append(shown, e)
 		}
 	}
 	a.chat.setEntries(shown)
 }
 
+// tea.Model
 func (a *app) View() tea.View {
 	v := tea.NewView(a.content())
 	v.AltScreen = true

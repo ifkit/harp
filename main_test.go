@@ -98,20 +98,20 @@ func TestACPSessionCommands(t *testing.T) {
 	a := testApp(t, m)
 
 	say(a, "hi")
-	id := a.sessionID
+	id := a.session.ID
 	for _, cmd := range []string{"/fork", "/rewind", "/fork-rewind"} {
 		say(a, cmd)
 		if e := lastEntry(a); e.role != failure || !strings.Contains(e.text, "--acp") {
 			t.Fatalf("%s: %v", cmd, e)
 		}
 	}
-	if a.pick != nil || a.sessionID != id || len(fileMessages(t, a, id)) != 3 || len(files(t, a)) != 1 {
+	if a.pick != nil || a.session.ID != id || len(fileMessages(t, a, id)) != 3 || len(files(t, a)) != 1 {
 		t.Fatal("refused commands changed something")
 	}
 
 	say(a, "/new")
 	say(a, "hi")
-	if a.sessionID == id {
+	if a.session.ID == id {
 		t.Fatal("/new must start a new saved session")
 	}
 	b, _ := os.ReadFile(log)

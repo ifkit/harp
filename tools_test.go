@@ -142,22 +142,18 @@ func TestLoadInvalidGivesEmptyRuntime(t *testing.T) {
 	}
 }
 
-func TestRuntimeStartsOnFirstUse(t *testing.T) {
+func TestLoadStartsRuntime(t *testing.T) {
 	r := newRuntimes()
 	defer r.close()
 	r.load(langJS, []byte(`{"a":1}`))
-	r.load(langLua, []byte(`{"b":2}`))
-	if r.js != nil || r.lua != nil {
-		t.Fatal("load created a runtime")
+	if r.rjs == nil || r.rlua != nil {
+		t.Fatal("load must start only its runtime")
 	}
 	if got := mustRun(t, r, langJS, "a"); got != "1" {
 		t.Fatalf("js: %q", got)
 	}
-	if r.lua != nil {
+	if r.rlua != nil {
 		t.Fatal("lua runtime created by a js call")
-	}
-	if _, st := saveAll(t, r); string(st[langLua]["b"]) != "2" {
-		t.Fatalf("saved lua state lost: %v", st)
 	}
 }
 

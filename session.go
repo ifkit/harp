@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -17,10 +19,100 @@ import (
 // store keeps one JSONL file per session: one schema.Message per line.
 type store struct{ dir string }
 
+// sessionInfo is one row of the session list.
 type sessionInfo struct {
 	ID       string
 	Modified time.Time
 	Title    string // first user message
+}
+
+// session is the open session: its messages, its runtimes and the current reply.
+type session struct {
+	ID      string            // empty until the first message
+	store   *store            // nil: nothing is saved
+	history []*schema.Message // exactly what the API receives
+	rt      *runtimes
+	sr      *schema.StreamReader[*schema.Message]
+	chunks  []*schema.Message // streamed chunks of the current reply
+	rounds  int               // tool rounds since the last user message
+}
+
+// loadSession opens the session id with the runtime state from its state files.
+// id is empty for a new session.
+func loadSession(st *store, id string, history []*schema.Message) *session {
+	s := &session{ID: id, store: st, history: history, rt: newRuntimes()}
+	if st != nil && id != "" {
+		for _, lang := range langs {
+			if data, err := st.LoadState(id, lang); err == nil {
+				s.rt.load(lang, data)
+			}
+		}
+	}
+	return s
+}
+
+// add appends msgs to the history and the session file. The first save creates the session
+// and writes the whole history.
+func (s *session) add(msgs ...*schema.Message) error {
+	s.history = append(s.history, msgs...)
+	if s.store == nil {
+		return nil
+	}
+	if s.ID != "" {
+		return s.store.Append(s.ID, msgs...)
+	}
+	id := newSessionID()
+	if err := s.store.Append(id, s.history...); err != nil {
+		return err
+	}
+	s.ID = id
+	return nil
+}
+
+// saveState writes the runtime state of the session.
+func (s *session) saveState() error {
+	if s.store == nil || s.ID == "" {
+		return nil
+	}
+	return s.writeState(s.ID)
+}
+
+// writeState writes one state file for each started runtime.
+func (s *session) writeState(id string) error {
+	files, err := s.rt.save()
+	for lang, data := range files {
+		if err == nil {
+			err = s.store.SaveState(id, lang, data)
+		}
+	}
+	return err
+}
+
+// close saves the runtime state and stops the runtimes.
+func (s *session) close() error {
+	err := s.saveState()
+	s.rt.close()
+	return err
+}
+
+// fork saves the first n messages and the runtime state as a new session.
+// It returns the new id also when only the runtime state was not saved.
+func (s *session) fork(n int) (string, []*schema.Message, error) {
+	h := slices.Clone(s.history[:n])
+	id := newSessionID()
+	if err := s.store.Append(id, h...); err != nil {
+		return "", nil, fmt.Errorf("save session: %w", err)
+	}
+	if err := s.writeState(id); err != nil {
+		return id, h, fmt.Errorf("save runtime state: %w", err)
+	}
+	return id, h, nil
+}
+
+// rewind cuts the session file to the first n messages.
+func (s *session) rewind(n int) ([]*schema.Message, error) {
+	h := slices.Clone(s.history[:n])
+	return h, s.store.Rewrite(s.ID, h)
 }
 
 func defaultStore() (*store, error) {

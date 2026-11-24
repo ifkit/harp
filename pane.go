@@ -85,7 +85,7 @@ func (p *pane) scrollbar() string {
 	rows := make([]string, h)
 	for i := range rows {
 		if i >= top && i < top+thumb {
-			rows[i] = "▒"
+			rows[i] = styleMeta.Render("░")
 		} else {
 			rows[i] = styleMeta.Render("│")
 		}

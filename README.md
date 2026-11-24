@@ -28,7 +28,7 @@ In the pickers, Up/Down or `j`/`k` select, Ctrl+N/Ctrl+P (3 lines) and the mouse
 
 With `--acp`, only `/new` and `/sessions` (list and delete) work: the agent keeps the history.
 
-## Code mode
+## REPL (Code mode)
 
 The model can run code with two tools: `REPLjs` (JavaScript, [goja](https://github.com/dop251/goja)) and `REPLlua` (Lua, [gopher-lua](https://github.com/yuin/gopher-lua)). Each session has its own runtimes. Their state survives a restart of Harp.
 

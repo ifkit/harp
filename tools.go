@@ -28,64 +28,81 @@ const (
 
 var langs = []string{langJS, langLua}
 
-// runtimes holds the JS and Lua runtimes of one session. Each runtime starts at the first call
-// of its tool. Until then, saved holds the state of that language as loaded from the state file.
+// repl is one started language runtime. Globals persist between calls of run.
+type repl interface {
+	run(code string, timeout time.Duration) (string, error)
+	save() map[string]json.RawMessage // data globals only
+	close()
+}
+
+// runtimes holds the runtimes of one session. A runtime starts at its first call,
+// or at load with the state from the state file.
 type runtimes struct {
 	mu      sync.Mutex // a tool call runs off the UI thread
 	timeout time.Duration
-	saved   map[string]map[string]json.RawMessage // language: global name: value
-
-	js     *goja.Runtime
-	jsBase map[string]bool // global names of a fresh runtime: not saved
-	jsOut  strings.Builder
-
-	lua     *lua.LState
-	luaBase map[string]bool
-	luaOut  strings.Builder
+	rjs     *jsRepl
+	rlua    *luaRepl
 }
 
 func newRuntimes() *runtimes { return &runtimes{timeout: runTimeout} }
 
-// load keeps the state of lang for its first call. Invalid data gives an empty runtime.
+// load starts the runtime of lang with the state in data. Invalid data gives an empty runtime.
 func (r *runtimes) load(lang string, data []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var st map[string]json.RawMessage
-	if json.Unmarshal(data, &st) != nil {
-		return
+	json.Unmarshal(data, &st)
+	r.start(lang, st)
+}
+
+// start replaces the runtime of lang with a new one that has the globals of saved.
+func (r *runtimes) start(lang string, saved map[string]json.RawMessage) (repl, error) {
+	switch lang {
+	case langJS:
+		if r.rjs != nil {
+			r.rjs.close()
+		}
+		r.rjs = startJS(saved)
+		return r.rjs, nil
+	case langLua:
+		if r.rlua != nil {
+			r.rlua.close()
+		}
+		r.rlua = startLua(saved)
+		return r.rlua, nil
 	}
-	if r.saved == nil {
-		r.saved = map[string]map[string]json.RawMessage{}
-	}
-	r.saved[lang] = st
+	return nil, fmt.Errorf("unknown language %q", lang)
 }
 
 // run executes code and returns the printed output followed by the value of the last expression.
 func (r *runtimes) run(lang, code string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	switch lang {
-	case langJS:
-		return r.runJS(code)
-	case langLua:
-		return r.runLua(code)
+	var rp repl
+	var err error
+	switch {
+	case lang == langJS && r.rjs != nil:
+		rp = r.rjs
+	case lang == langLua && r.rlua != nil:
+		rp = r.rlua
+	default:
+		if rp, err = r.start(lang, nil); err != nil {
+			return "", err
+		}
 	}
-	return "", fmt.Errorf("unknown language %q", lang)
+	return rp.run(code, r.timeout)
 }
 
-// save returns the state file content of each language that was used or loaded.
+// save returns the state file content of each started runtime.
 func (r *runtimes) save() (map[string][]byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	st := map[string]map[string]json.RawMessage{}
-	for k, v := range r.saved {
-		st[k] = v
+	if r.rjs != nil {
+		st[langJS] = r.rjs.save()
 	}
-	if r.js != nil {
-		st[langJS] = r.saveJS()
-	}
-	if r.lua != nil {
-		st[langLua] = r.saveLua()
+	if r.rlua != nil {
+		st[langLua] = r.rlua.save()
 	}
 	out := map[string][]byte{}
 	for lang, v := range st {
@@ -101,10 +118,13 @@ func (r *runtimes) save() (map[string][]byte, error) {
 func (r *runtimes) close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.lua != nil {
-		r.lua.Close()
+	if r.rjs != nil {
+		r.rjs.close()
 	}
-	r.js, r.lua, r.saved = nil, nil, nil
+	if r.rlua != nil {
+		r.rlua.close()
+	}
+	r.rjs, r.rlua = nil, nil
 }
 
 func names(keys []string) map[string]bool {
@@ -115,41 +135,45 @@ func names(keys []string) map[string]bool {
 	return m
 }
 
-func (r *runtimes) startJS() {
-	vm := goja.New()
+type jsRepl struct {
+	vm   *goja.Runtime
+	base map[string]bool // global names of a fresh runtime: not saved
+	out  strings.Builder
+}
+
+func startJS(saved map[string]json.RawMessage) *jsRepl {
+	r := &jsRepl{vm: goja.New()}
+	vm := r.vm
 	console := vm.NewObject()
 	console.Set("log", func(c goja.FunctionCall) goja.Value {
 		parts := make([]string, len(c.Arguments))
 		for i, a := range c.Arguments {
 			parts[i] = a.String()
 		}
-		r.jsOut.WriteString(strings.Join(parts, " "))
-		r.jsOut.WriteString("\n")
+		r.out.WriteString(strings.Join(parts, " "))
+		r.out.WriteString("\n")
 		return goja.Undefined()
 	})
 	vm.Set("console", console)
-	r.js, r.jsBase = vm, names(vm.GlobalObject().Keys())
+	r.base = names(vm.GlobalObject().Keys())
 	parse, _ := goja.AssertFunction(vm.Get("JSON").ToObject(vm).Get("parse"))
-	for name, raw := range r.saved[langJS] {
+	for name, raw := range saved {
 		if v, err := parse(goja.Undefined(), vm.ToValue(string(raw))); err == nil {
 			vm.Set(name, v)
 		}
 	}
-	delete(r.saved, langJS)
+	return r
 }
 
-func (r *runtimes) runJS(code string) (string, error) {
-	if r.js == nil {
-		r.startJS()
-	}
-	r.jsOut.Reset()
-	t := time.AfterFunc(r.timeout, func() { r.js.Interrupt("timeout") })
-	v, err := r.js.RunString(code)
+func (r *jsRepl) run(code string, timeout time.Duration) (string, error) {
+	r.out.Reset()
+	t := time.AfterFunc(timeout, func() { r.vm.Interrupt("timeout") })
+	v, err := r.vm.RunString(code)
 	t.Stop()
-	r.js.ClearInterrupt()
-	out := r.jsOut.String()
+	r.vm.ClearInterrupt()
+	out := r.out.String()
 	if _, ok := errors.AsType[*goja.InterruptedError](err); ok {
-		return out, fmt.Errorf("timeout after %v", r.timeout)
+		return out, fmt.Errorf("timeout after %v", timeout)
 	}
 	if err != nil {
 		return out, err
@@ -167,12 +191,12 @@ func (r *runtimes) runJS(code string) (string, error) {
 	return out + v.String(), nil
 }
 
-func (r *runtimes) saveJS() map[string]json.RawMessage {
+func (r *jsRepl) save() map[string]json.RawMessage {
 	st := map[string]json.RawMessage{}
-	g := r.js.GlobalObject()
+	g := r.vm.GlobalObject()
 	for _, k := range g.Keys() {
 		v := g.Get(k)
-		if r.jsBase[k] || v == nil {
+		if r.base[k] || v == nil {
 			continue
 		}
 		if _, isFn := goja.AssertFunction(v); isFn {
@@ -185,8 +209,17 @@ func (r *runtimes) saveJS() map[string]json.RawMessage {
 	return st
 }
 
-func (r *runtimes) startLua() {
+func (r *jsRepl) close() {}
+
+type luaRepl struct {
+	L    *lua.LState
+	base map[string]bool
+	out  strings.Builder
+}
+
+func startLua(saved map[string]json.RawMessage) *luaRepl {
 	L := lua.NewState(lua.Options{SkipOpenLibs: true})
+	r := &luaRepl{L: L}
 	for name, open := range map[string]lua.LGFunction{
 		lua.BaseLibName: lua.OpenBase, lua.TabLibName: lua.OpenTable,
 		lua.StringLibName: lua.OpenString, lua.MathLibName: lua.OpenMath,
@@ -203,44 +236,40 @@ func (r *runtimes) startLua() {
 		for i := range parts {
 			parts[i] = L.ToStringMeta(L.Get(i + 1)).String()
 		}
-		r.luaOut.WriteString(strings.Join(parts, "\t"))
-		r.luaOut.WriteString("\n")
+		r.out.WriteString(strings.Join(parts, "\t"))
+		r.out.WriteString("\n")
 		return 0
 	}))
-	base := map[string]bool{}
-	L.G.Global.ForEach(func(k, _ lua.LValue) { base[k.String()] = true })
-	r.lua, r.luaBase = L, base
-	for name, raw := range r.saved[langLua] {
+	r.base = map[string]bool{}
+	L.G.Global.ForEach(func(k, _ lua.LValue) { r.base[k.String()] = true })
+	for name, raw := range saved {
 		var v any
 		if json.Unmarshal(raw, &v) == nil {
 			L.SetGlobal(name, toLua(L, v))
 		}
 	}
-	delete(r.saved, langLua)
+	return r
 }
 
-func (r *runtimes) runLua(code string) (string, error) {
-	if r.lua == nil {
-		r.startLua()
-	}
-	L := r.lua
-	r.luaOut.Reset()
+func (r *luaRepl) run(code string, timeout time.Duration) (string, error) {
+	L := r.L
+	r.out.Reset()
 	fn, err := L.LoadString("return " + code)
 	if err != nil {
 		if fn, err = L.LoadString(code); err != nil {
 			return "", err
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	L.SetContext(ctx)
 	defer L.RemoveContext()
 	L.Push(fn)
 	err = L.PCall(0, lua.MultRet, nil)
-	out := r.luaOut.String()
+	out := r.out.String()
 	if ctx.Err() != nil {
 		L.SetTop(0)
-		return out, fmt.Errorf("timeout after %v", r.timeout)
+		return out, fmt.Errorf("timeout after %v", timeout)
 	}
 	if err != nil {
 		L.SetTop(0)
@@ -254,11 +283,11 @@ func (r *runtimes) runLua(code string) (string, error) {
 	return out + strings.Join(vals, "\t"), nil
 }
 
-func (r *runtimes) saveLua() map[string]json.RawMessage {
+func (r *luaRepl) save() map[string]json.RawMessage {
 	st := map[string]json.RawMessage{}
-	r.lua.G.Global.ForEach(func(k, v lua.LValue) {
+	r.L.G.Global.ForEach(func(k, v lua.LValue) {
 		name, ok := k.(lua.LString)
-		if !ok || r.luaBase[string(name)] {
+		if !ok || r.base[string(name)] {
 			return
 		}
 		if x, ok := fromLua(v, 0, map[*lua.LTable]bool{}); ok {
@@ -269,6 +298,8 @@ func (r *runtimes) saveLua() map[string]json.RawMessage {
 	})
 	return st
 }
+
+func (r *luaRepl) close() { r.L.Close() }
 
 // fromLua converts data values; it reports false for functions, userdata, threads, cycles and too deep tables.
 func fromLua(v lua.LValue, depth int, seen map[*lua.LTable]bool) (any, bool) {
@@ -344,7 +375,7 @@ var errTooManyToolCalls = errors.New("too many tool calls")
 var toolLang = map[string]string{"REPLjs": langJS, "REPLlua": langLua}
 
 func toolInfos() []*schema.ToolInfo {
-	limits := " Globals persist between calls in this session and are saved with it; only data (numbers, strings, booleans, null, arrays, objects) survives a restart, functions do not. Each call stops after 10 seconds. No file, network, or process access."
+	limits := "Globals persist between calls in this session and are saved with it; only data (numbers, strings, booleans, null, arrays, objects) survives a restart, functions do not. Each call stops after 10 seconds. No file, network, or process access."
 	code := func(desc string) *schema.ParamsOneOf {
 		return schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
 			"code": {Type: schema.String, Desc: desc, Required: true},
@@ -352,12 +383,14 @@ func toolInfos() []*schema.ToolInfo {
 	}
 	return []*schema.ToolInfo{
 		{
-			Name: "REPLjs", Desc: "Run JavaScript code. Returns console.log output and the value of the last expression. Use var for globals." +
-				"MANDATORY: You MUST use var for all variable declarations that need to persist between tool calls, instead they cannot be recovered." + limits,
+			Name: "REPLjs", Desc: "Run JavaScript code. Returns console.log output and the value of the last expression. Use var for globals. " +
+				"MANDATORY: You MUST use var for all variable declarations that need to persist between tool calls, instead they cannot be recovered. " + limits,
 			ParamsOneOf: code("JavaScript code"),
 		},
 		{
-			Name: "REPLlua", Desc: "Run Lua code. Returns print output and the value of the last expression. Libraries: base, table, string, math." + limits, ParamsOneOf: code("Lua code"),
+			Name:        "REPLlua",
+			Desc:        "Run Lua code. Returns print output and the value of the last expression. Libraries: base, table, string, math. " + limits,
+			ParamsOneOf: code("Lua code"),
 		},
 	}
 }
@@ -371,20 +404,24 @@ func withTools(cm model.BaseChatModel) (model.BaseChatModel, error) {
 	return tcm.WithTools(toolInfos())
 }
 
-// toolTurn joins the streamed chunks. It returns the assistant message with tool calls, or nil
-// when the model gave a final answer. rounds counts the tool rounds of the current user message.
-func toolTurn(chunks []*schema.Message, rounds *int) (*schema.Message, error) {
+// toolTurn joins the streamed chunks. It returns the answer text, and the assistant message
+// with tool calls or nil when the model gave a final answer. rounds counts the tool rounds
+// of the current user message.
+func toolTurn(chunks []*schema.Message, rounds *int) (string, *schema.Message, error) {
 	if len(chunks) == 0 {
-		return nil, nil
+		return "", nil, nil
 	}
 	msg, err := schema.ConcatMessages(chunks)
-	if err != nil || len(msg.ToolCalls) == 0 {
-		return nil, err
+	if err != nil {
+		return "", nil, err
+	}
+	if len(msg.ToolCalls) == 0 {
+		return msg.Content, nil, nil
 	}
 	if *rounds++; *rounds >= maxToolRounds {
-		return nil, errTooManyToolCalls
+		return "", nil, errTooManyToolCalls
 	}
-	return &schema.Message{Role: schema.Assistant, Content: msg.Content, ReasoningContent: msg.ReasoningContent, ToolCalls: msg.ToolCalls}, nil
+	return msg.Content, &schema.Message{Role: schema.Assistant, Content: msg.Content, ReasoningContent: msg.ReasoningContent, ToolCalls: msg.ToolCalls}, nil
 }
 
 type toolDoneMsg struct{ results []*schema.Message } // one tool message for each call, in order

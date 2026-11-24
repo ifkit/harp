@@ -39,7 +39,7 @@ func say(a *app, text string) {
 	if !a.busy {
 		return
 	}
-	sr, err := a.chatModel.Stream(context.Background(), a.history)
+	sr, err := a.chatModel.Stream(context.Background(), a.session.history)
 	if err != nil {
 		panic(err)
 	}
@@ -80,15 +80,15 @@ func TestSessionCreatedByFirstMessage(t *testing.T) {
 	}
 	say(a, "ping")
 	ids := files(t, a)
-	if len(ids) != 1 || ids[0] != a.sessionID {
-		t.Fatalf("ids=%v session=%q", ids, a.sessionID)
+	if len(ids) != 1 || ids[0] != a.session.ID {
+		t.Fatalf("ids=%v session=%q", ids, a.session.ID)
 	}
-	msgs := fileMessages(t, a, a.sessionID)
+	msgs := fileMessages(t, a, a.session.ID)
 	if len(msgs) != 3 || msgs[0].Role != schema.System || msgs[1].Content != "ping" || msgs[2].Content != "pong" {
 		t.Fatalf("msgs=%v", msgs)
 	}
 	say(a, "again")
-	if n := len(fileMessages(t, a, a.sessionID)); n != 5 {
+	if n := len(fileMessages(t, a, a.session.ID)); n != 5 {
 		t.Fatalf("messages=%d", n)
 	}
 }
@@ -106,13 +106,13 @@ func TestCommandParsing(t *testing.T) {
 	a.busy = true
 	a.input.SetValue("/new")
 	press(a, tea.Key{Code: tea.KeyEnter})
-	if e := lastEntry(a); e.role != failure || a.sessionID != "" {
+	if e := lastEntry(a); e.role != failure || a.session.ID != "" {
 		t.Fatalf("busy: %v", e)
 	}
 	a.busy = false
 	say(a, "/unknown")
-	if len(a.history) != 3 || a.history[1].Content != "/unknown" {
-		t.Fatalf("history=%v", a.history)
+	if len(a.session.history) != 3 || a.session.history[1].Content != "/unknown" {
+		t.Fatalf("history=%v", a.session.history)
 	}
 }
 
@@ -123,10 +123,10 @@ func TestSessionsPicker(t *testing.T) {
 		t.Fatal("empty list must show an error")
 	}
 	say(a, "first")
-	first := a.sessionID
+	first := a.session.ID
 	say(a, "/new")
 	say(a, "second")
-	second := a.sessionID
+	second := a.session.ID
 	if first == second {
 		t.Fatal("same id")
 	}
@@ -147,8 +147,8 @@ func TestSessionsPicker(t *testing.T) {
 		}
 	}
 	press(a, tea.Key{Code: tea.KeyEnter})
-	if a.pick != nil || a.sessionID != first || a.history[1].Content != "first" {
-		t.Fatalf("session=%q history=%v", a.sessionID, a.history)
+	if a.pick != nil || a.session.ID != first || a.session.history[1].Content != "first" {
+		t.Fatalf("session=%q history=%v", a.session.ID, a.session.history)
 	}
 	say(a, "more")
 	if n := len(fileMessages(t, a, first)); n != 5 {
@@ -172,7 +172,7 @@ func TestSessionsPicker(t *testing.T) {
 	if ids := files(t, a); len(ids) != 1 || ids[0] != second {
 		t.Fatalf("ids=%v", ids)
 	}
-	if a.sessionID != "" || len(a.history) != 1 {
+	if a.session.ID != "" || len(a.session.history) != 1 {
 		t.Fatal("deleting the open session must reset")
 	}
 	if a.pick == nil || len(a.pick.items) != 1 {
@@ -187,19 +187,19 @@ func TestNewAndFork(t *testing.T) {
 		t.Fatal("fork without messages must fail")
 	}
 	say(a, "hi")
-	old := a.sessionID
+	old := a.session.ID
 	say(a, "/fork")
-	if a.sessionID == old || len(fileMessages(t, a, a.sessionID)) != 3 || len(fileMessages(t, a, old)) != 3 {
-		t.Fatalf("session=%q old=%q", a.sessionID, old)
+	if a.session.ID == old || len(fileMessages(t, a, a.session.ID)) != 3 || len(fileMessages(t, a, old)) != 3 {
+		t.Fatalf("session=%q old=%q", a.session.ID, old)
 	}
 	say(a, "next")
-	if len(fileMessages(t, a, old)) != 3 || len(fileMessages(t, a, a.sessionID)) != 5 {
+	if len(fileMessages(t, a, old)) != 3 || len(fileMessages(t, a, a.session.ID)) != 5 {
 		t.Fatal("fork and original must be separate")
 	}
 
-	cur := a.sessionID
+	cur := a.session.ID
 	say(a, "/new")
-	if a.sessionID != "" || len(a.entries) != 1 || a.entries[0].role != sentSystem {
+	if a.session.ID != "" || len(a.entries) != 1 || a.entries[0].role != sentSystem {
 		t.Fatalf("entries=%v", a.entries)
 	}
 	if len(files(t, a)) != 2 || len(fileMessages(t, a, cur)) != 5 {
@@ -211,7 +211,7 @@ func rewindFixture(t *testing.T) (*app, string) {
 	a := testApp(t, stubModel{"pong"})
 	say(a, "one")
 	say(a, "two")
-	id := a.sessionID
+	id := a.session.ID
 	say(a, "/rewind")
 	if a.pick == nil || len(a.pick.items) != 4 || a.pick.sel != 3 {
 		t.Fatalf("pick=%+v", a.pick)
@@ -228,13 +228,13 @@ func TestRewind(t *testing.T) {
 		t.Fatal("rewind must ask for confirmation")
 	}
 	pressText(a, "n")
-	if a.pick == nil || len(a.history) != 5 || len(fileMessages(t, a, id)) != 5 {
+	if a.pick == nil || len(a.session.history) != 5 || len(fileMessages(t, a, id)) != 5 {
 		t.Fatal("declined rewind changed something")
 	}
 	press(a, tea.Key{Code: tea.KeyEnter})
 	pressText(a, "y")
-	if a.pick != nil || len(a.history) != 3 || a.history[2].Content != "pong" {
-		t.Fatalf("history=%v", a.history)
+	if a.pick != nil || len(a.session.history) != 3 || a.session.history[2].Content != "pong" {
+		t.Fatalf("history=%v", a.session.history)
 	}
 	if n := len(fileMessages(t, a, id)); n != 3 {
 		t.Fatalf("file messages=%d", n)
@@ -252,15 +252,15 @@ func TestForkRewind(t *testing.T) {
 	}
 	say(a, "one")
 	say(a, "two")
-	id := a.sessionID
+	id := a.session.ID
 	say(a, "/fork-rewind")
 	press(a, tea.Key{Code: tea.KeyUp})
 	press(a, tea.Key{Code: tea.KeyUp})
 	press(a, tea.Key{Code: tea.KeyEnter})
-	if a.pick != nil || a.sessionID == id || len(a.history) != 3 {
-		t.Fatalf("session=%q history=%v", a.sessionID, a.history)
+	if a.pick != nil || a.session.ID == id || len(a.session.history) != 3 {
+		t.Fatalf("session=%q history=%v", a.session.ID, a.session.history)
 	}
-	if len(fileMessages(t, a, a.sessionID)) != 3 || len(fileMessages(t, a, id)) != 5 {
+	if len(fileMessages(t, a, a.session.ID)) != 3 || len(fileMessages(t, a, id)) != 5 {
 		t.Fatal("original must not change")
 	}
 }

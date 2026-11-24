@@ -60,14 +60,14 @@ func TestToolThenAnswer(t *testing.T) {
 	a := testApp(t, toolModel{})
 	ask(a, "6 * 7")
 	var roles []schema.RoleType
-	for _, m := range a.history {
+	for _, m := range a.session.history {
 		roles = append(roles, m.Role)
 	}
 	want := []schema.RoleType{schema.System, schema.User, schema.Assistant, schema.Tool, schema.Assistant}
-	if len(roles) != len(want) || a.history[3].Content != "42" || a.history[4].Content != "got 42" {
-		t.Fatalf("history roles=%v last=%q", roles, a.history[len(a.history)-1].Content)
+	if len(roles) != len(want) || a.session.history[3].Content != "42" || a.session.history[4].Content != "got 42" {
+		t.Fatalf("history roles=%v last=%q", roles, a.session.history[len(a.session.history)-1].Content)
 	}
-	saved := fileMessages(t, a, a.sessionID)
+	saved := fileMessages(t, a, a.session.ID)
 	if len(saved) != 5 || len(saved[2].ToolCalls) != 1 || saved[3].ToolCallID != "c1" {
 		t.Fatalf("saved=%v", saved)
 	}
@@ -85,7 +85,7 @@ func TestToolRoundLimit(t *testing.T) {
 	if a.busy || lastEntry(a).text != "error: too many tool calls" {
 		t.Fatalf("busy=%v last=%v", a.busy, lastEntry(a))
 	}
-	if a.history[len(a.history)-1].Role != schema.Tool {
+	if a.session.history[len(a.session.history)-1].Role != schema.Tool {
 		t.Fatal("history must end with a tool result")
 	}
 	a.chatModel = toolModel{}
@@ -98,7 +98,7 @@ func TestToolRoundLimit(t *testing.T) {
 func TestStateFollowsSession(t *testing.T) {
 	a := testApp(t, toolModel{})
 	ask(a, "var x = 5")
-	first := a.sessionID
+	first := a.session.ID
 	say(a, "/new")
 	ask(a, "typeof x")
 	if lastEntry(a).text != "got undefined" {
@@ -111,7 +111,7 @@ func TestStateFollowsSession(t *testing.T) {
 	}
 
 	say(a, "/fork")
-	fork := a.sessionID
+	fork := a.session.ID
 	ask(a, "x = 9")
 	a.openSession(first)
 	ask(a, "x")
@@ -128,7 +128,7 @@ func TestStateFollowsSession(t *testing.T) {
 func TestDeleteCurrentSessionKeepsNoState(t *testing.T) {
 	a := testApp(t, toolModel{})
 	ask(a, "var x = 1")
-	id := a.sessionID
+	id := a.session.ID
 	a.saveState()
 	say(a, "/sessions")
 	pressText(a, "d")
