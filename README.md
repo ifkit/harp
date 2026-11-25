@@ -30,6 +30,8 @@ With `--acp`, only `/new` and `/sessions` (list and delete) work: the agent keep
 
 ## REPL (Code mode)
 
+When working with large data, the session context can quickly overfill. Using runtime JS or Lua, models can use REPL mode to execute code and store the data in variables without polluting the context.
+
 The model can run code with two tools: `REPLjs` (JavaScript, [goja](https://github.com/dop251/goja)) and `REPLlua` (Lua, [gopher-lua](https://github.com/yuin/gopher-lua)). Each session has its own runtimes. Their state survives a restart of Harp.
 
 With `--acp`, there are no tools and REPL is not supported: the agent has its own.
