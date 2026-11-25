@@ -1,6 +1,6 @@
 # Harp
 
-Terminal AI chat (default API endpoint as for LM Studio:`localhost:1234`). Built on [eino](https://github.com/cloudwego/eino) and Bubble Tea v2.
+TUI AI harness with [REPL (Code Mode)](#repl-code-mode) (default API endpoint as for LM Studio:`localhost:1234`). Built on [eino](https://github.com/cloudwego/eino) and Bubble Tea v2.
 
 ```
 go run . --openai https://api.anthropic.com/v1 --model claude-sonnet-5-5 --key <your_key>
@@ -28,7 +28,7 @@ In the pickers, Up/Down or `j`/`k` select, Ctrl+N/Ctrl+P (3 lines) and the mouse
 
 With `--acp`, only `/new` and `/sessions` (list and delete) work: the agent keeps the history.
 
-## REPL (Code mode)
+## REPL (Code Mode)
 
 When working with large data, the session context can quickly overfill. Using runtime JS or Lua, models can use REPL mode to execute code and store the data in variables without polluting the context.
 
